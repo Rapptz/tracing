@@ -108,6 +108,8 @@ struct Inner {
     rotation: Rotation,
     next_date: AtomicUsize,
     max_files: Option<usize>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    log_symlink_name: Option<String>,
 }
 
 // === impl RollingFileAppender ===
@@ -190,6 +192,7 @@ impl RollingFileAppender {
             ref prefix,
             ref suffix,
             ref max_files,
+            ref symlink,
         } = builder;
         let directory = directory.as_ref().to_path_buf();
         let now = OffsetDateTime::now_utc();
@@ -200,6 +203,7 @@ impl RollingFileAppender {
             prefix.clone(),
             suffix.clone(),
             *max_files,
+            symlink.clone(),
         )?;
         Ok(Self {
             state,
@@ -525,6 +529,7 @@ impl Inner {
         log_filename_prefix: Option<String>,
         log_filename_suffix: Option<String>,
         max_files: Option<usize>,
+        log_symlink_name: Option<String>,
     ) -> Result<(Self, RwLock<File>), builder::InitError> {
         let log_directory = directory.as_ref().to_path_buf();
         let date_format = rotation.date_format();
@@ -542,9 +547,11 @@ impl Inner {
             ),
             rotation,
             max_files,
+            log_symlink_name,
         };
         let filename = inner.join_date(&now);
         let writer = RwLock::new(create_writer(inner.log_directory.as_ref(), &filename)?);
+        inner.refresh_symlink(inner.log_directory.as_ref(), &filename)?;
         Ok((inner, writer))
     }
 
@@ -634,6 +641,23 @@ impl Inner {
         }
     }
 
+    #[cfg(unix)]
+    fn refresh_symlink(&self, directory: &Path, filename: &str) -> Result<(), InitError> {
+        if let Some(symlink) = self.log_symlink_name.as_deref() {
+            let new_location = directory.join(filename);
+            let symlink_path = directory.join(symlink);
+            let temp = symlink_path.with_extension("temp.link");
+            std::os::unix::fs::symlink(new_location, &temp).map_err(InitError::ctx("failed to create symlink"))?;
+            fs::rename(temp, symlink_path).map_err(InitError::ctx("failed to replace symlink"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn refresh_symlink(&self, _directory: &Path, _filename: &str) -> Result<(), InitError> {
+        Ok(())
+    }
+
     fn refresh_writer(&self, now: OffsetDateTime, file: &mut File) {
         let filename = self.join_date(&now);
 
@@ -645,6 +669,9 @@ impl Inner {
             Ok(new_file) => {
                 if let Err(err) = file.flush() {
                     eprintln!("Couldn't flush previous writer: {}", err);
+                }
+                if let Err(err) = self.refresh_symlink(&self.log_directory, &filename) {
+                    eprintln!("Couldn't create a symlink: {}", err);
                 }
                 *file = new_file;
             }
@@ -829,6 +856,7 @@ mod test {
                 prefix.map(ToString::to_string),
                 suffix.map(ToString::to_string),
                 None,
+                None,
             )
             .unwrap();
             let path = inner.join_date(&now);
@@ -941,6 +969,7 @@ mod test {
             Some("test_make_writer".to_string()),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1023,6 +1052,7 @@ mod test {
             Some("test_max_log_files".to_string()),
             None,
             Some(2),
+            None,
         )
         .unwrap();
 
@@ -1101,6 +1131,99 @@ mod test {
                 }
                 "2020-02-01-12" => {
                     assert_eq!("file 3\nfile 3\n", file);
+                }
+                x => panic!("unexpected date {}", x),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_create_symlink() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+
+        let format = format_description::parse(
+            "[year]-[month]-[day] [hour]:[minute]:[second] [offset_hour \
+         sign:mandatory]:[offset_minute]:[offset_second]",
+        )
+        .unwrap();
+
+        let now = OffsetDateTime::parse("2020-02-01 10:01:00 +00:00:00", &format).unwrap();
+        let directory = tempfile::tempdir().expect("failed to create tempdir");
+        let (state, writer) = Inner::new(
+            now,
+            Rotation::HOURLY,
+            directory.path(),
+            Some("test_make_writer".to_string()),
+            None,
+            None,
+            Some("latest.log".to_owned()),
+        )
+        .unwrap();
+
+        let clock = Arc::new(Mutex::new(now));
+        let now = {
+            let clock = clock.clone();
+            Box::new(move || *clock.lock().unwrap())
+        };
+        let appender = RollingFileAppender { state, writer, now };
+        let default = tracing_subscriber::fmt()
+            .without_time()
+            .with_level(false)
+            .with_target(false)
+            .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+            .with_writer(appender)
+            .finish()
+            .set_default();
+
+        tracing::info!("file 1");
+
+        // advance time by one second
+        (*clock.lock().unwrap()) += Duration::seconds(1);
+
+        tracing::info!("file 1");
+
+        // Ensure the symlink was created and points to the proper file
+        let symlink_path = directory.path().join("latest.log");
+        assert!(symlink_path.is_symlink());
+        let contents = fs::read_to_string(&symlink_path).expect("Failed to read symlink");
+        assert_eq!(contents, "file 1\nfile 1\n");
+
+        // advance time by one hour
+        (*clock.lock().unwrap()) += Duration::hours(1);
+
+        tracing::info!("file 2");
+
+        // advance time by one second
+        (*clock.lock().unwrap()) += Duration::seconds(1);
+
+        tracing::info!("file 2");
+
+        drop(default);
+
+        let dir_contents = fs::read_dir(directory.path()).expect("Failed to read directory");
+        println!("dir={:?}", dir_contents);
+        for entry in dir_contents {
+            println!("entry={:?}", entry);
+            let path = entry.expect("Expected dir entry").path();
+            let file = fs::read_to_string(&path).expect("Failed to read file");
+            println!("path={}\nfile={:?}", path.display(), file);
+
+            match path
+                .extension()
+                .expect("found a file without a date!")
+                .to_str()
+                .expect("extension should be UTF8")
+            {
+                "2020-02-01-10" => {
+                    assert_eq!("file 1\nfile 1\n", file);
+                }
+                "2020-02-01-11" => {
+                    assert_eq!("file 2\nfile 2\n", file);
+                }
+                "log" => {
+                    assert_eq!("file 2\nfile 2\n", file);
                 }
                 x => panic!("unexpected date {}", x),
             }

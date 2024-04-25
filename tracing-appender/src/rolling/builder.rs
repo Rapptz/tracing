@@ -11,6 +11,7 @@ pub struct Builder {
     pub(super) prefix: Option<String>,
     pub(super) suffix: Option<String>,
     pub(super) max_files: Option<usize>,
+    pub(super) symlink: Option<String>,
 }
 
 /// Errors returned by [`Builder::build`].
@@ -42,11 +43,13 @@ impl Builder {
     /// | [`filename_prefix`] | `""` | By default, log file names will not have a prefix. |
     /// | [`filename_suffix`] | `""` | By default, log file names will not have a suffix. |
     /// | [`max_log_files`] | `None` | By default, there is no limit for maximum log file count. |
+    /// | [`symlink`] | `None` | By default, there is no symlink created. |
     ///
     /// [`rotation`]: Self::rotation
     /// [`filename_prefix`]: Self::filename_prefix
     /// [`filename_suffix`]: Self::filename_suffix
     /// [`max_log_files`]: Self::max_log_files
+    /// [`symlink`]: Self::symlink
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -54,6 +57,7 @@ impl Builder {
             prefix: None,
             suffix: None,
             max_files: None,
+            symlink: None,
         }
     }
 
@@ -229,6 +233,41 @@ impl Builder {
     pub fn max_log_files(self, n: usize) -> Self {
         Self {
             max_files: Some(n),
+            ..self
+        }
+    }
+
+    /// Creates a symlink to the latest rotated log file.
+    ///
+    /// When a new log file is created, a symlink will be created or updated
+    /// to point to the newest log file at the specified name. If no value
+    /// is supplied, the `RollingAppender` will not create a symlink.
+    ///
+    /// Symlink names ignore [`filename_prefix`] and [`filename_suffix`].
+    /// Symlinks are also only available on Unix platforms, on Windows
+    /// this setting is silently ignored.
+    ///
+    /// [`filename_prefix`]: Self::filename_prefix
+    /// [`filename_suffix`]: Self::filename_suffix
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tracing_appender::rolling::RollingFileAppender;
+    ///
+    /// # fn docs() {
+    /// let appender = RollingFileAppender::builder()
+    ///     .symlink("latest.log") // Create a symlink to /var/log/latest.log
+    ///     // ...
+    ///     .build("/var/log")
+    ///     .expect("failed to initialize rolling file appender");
+    /// # drop(appender)
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn symlink(self, name: impl Into<String>) -> Self {
+        Self {
+            symlink: Some(name.into()),
             ..self
         }
     }
